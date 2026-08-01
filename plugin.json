@@ -1,0 +1,5 @@
+{
+  "name": "media-tools",
+  "description": "Download audio/video with yt-dlp, selectable playlist previews, generic and configurable media discovery, batch transcode with FFmpeg/HandBrake, lossless edits with FFmpeg stream copy or LosslessCut, plus date-extraction rules for media filenames.",
+  "version": "1.0.0"
+}
