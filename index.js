@@ -2415,12 +2415,23 @@ async function downloadMedia(args) {
     "wav",
   ];
   const VIDEO_CONTAINERS = ["mkv", "mp4", "webm", "mov"];
+  const requestedAudioFormat =
+    mode === "audio" && AUDIO_FORMATS.includes(args.audioFormat)
+      ? args.audioFormat
+      : "";
+  // Dive has no mid-execution prompt, so a re-encode cannot be confirmed in
+  // place. Refuse instead: the model relays this, the user decides, and only
+  // then is confirmAudioConversion set. "best" copies the source stream and
+  // needs no confirmation, so the ordinary path is unaffected.
+  if (
+    requestedAudioFormat &&
+    requestedAudioFormat !== "best" &&
+    args.confirmAudioConversion !== true
+  ) {
+    return lossyAudioConversionRefusal(requestedAudioFormat);
+  }
   const audioFormat =
-    mode === "audio"
-      ? AUDIO_FORMATS.includes(args.audioFormat)
-        ? args.audioFormat
-        : "best"
-      : undefined;
+    mode === "audio" ? requestedAudioFormat || "best" : undefined;
   const videoContainer =
     mode === "video"
       ? compatibilityProfile === "mac-lg-tv"
@@ -2548,8 +2559,10 @@ async function downloadMedia(args) {
   });
 
   const results = [];
+  const downloadedUrls = [];
   for (const job of jobs) {
     const execResult = await exec("yt-dlp", job.args);
+    if (execResult.code === 0) downloadedUrls.push(...job.urls);
     results.push({
       label: job.label,
       urlCount: job.urls.length,
@@ -2559,7 +2572,154 @@ async function downloadMedia(args) {
       stderr: execResult.stderr,
     });
   }
-  return summarizeDownloadResults(results, destinationSelection.path);
+  let summary = summarizeDownloadResults(results, destinationSelection.path);
+  if (args.tracklist !== false && downloadedUrls.length > 0) {
+    const written = await writeBbcTracklists(
+      downloadedUrls,
+      destinationSelection.path,
+    );
+    if (written.length > 0) {
+      summary += `\n\nTracklists written: ${written.length}\n${written
+        .map((file) => `  ${path.basename(file)}`)
+        .join("\n")}`;
+    }
+  }
+  return summary;
+}
+
+function lossyAudioConversionRefusal(format) {
+  const lossy = ["mp3", "opus", "vorbis"].includes(format);
+  return [
+    `Refused: audioFormat="${format}" was not run.`,
+    "",
+    lossy
+      ? `Converting to ${format} re-encodes already-lossy audio a second time and permanently degrades it.`
+      : `Converting to ${format} re-encodes the audio; for a lossy source it gains no quality and produces much larger files.`,
+    "Leaving audioFormat unset copies the source stream exactly, with no re-encode.",
+    "",
+    "Ask the user which they want. Download with audioFormat unset, or, only if",
+    `the user explicitly asks for ${format}, call again with audioFormat="${format}"`,
+    "and confirmAudioConversion=true.",
+  ].join("\n");
+}
+
+// ---------- BBC tracklists ----------
+
+async function fetchBbcJson(url) {
+  try {
+    const result = await exec("curl", [
+      "-sL",
+      "--max-time",
+      "20",
+      "-A",
+      "Mozilla/5.0",
+      url,
+    ]);
+    if (result.code !== 0 || !String(result.stdout || "").trim())
+      return undefined;
+    return JSON.parse(result.stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+function tracklistCell(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+function tracklistTimestamp(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  const whole = Math.floor(seconds);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = whole % 60;
+  const mm = String(minutes).padStart(hours > 0 ? 2 : 1, "0");
+  return `${hours > 0 ? `${hours}:` : ""}${mm}:${String(rest).padStart(2, "0")}`;
+}
+
+// Matches the audio filename yt-dlp writes ("<date> - <brand>, <episode>"), so
+// the tracklist sorts directly beside the recording it belongs to.
+function bbcTracklistBasename(programme) {
+  const episodeTitle = String(programme?.title || "").trim();
+  if (!episodeTitle) return "";
+  const brand = String(programme?.parent?.programme?.title || "").trim();
+  const date = String(programme?.first_broadcast_date || "").slice(0, 10);
+  const stamp = /^\d{4}-\d{2}-\d{2}$/.test(date)
+    ? date.replace(/-/g, ".")
+    : "UnknownDate";
+  const title = brand ? `${brand}, ${episodeTitle}` : episodeTitle;
+  return `${stamp} \u2014 ${title}`.replace(/[/\\:*?"<>|]/g, "-").slice(0, 180);
+}
+
+function buildBbcTracklistMarkdown(programme, segmentEvents, pid) {
+  const tracks = segmentEvents.filter(
+    (event) => event && event.segment && event.segment.type === "music",
+  );
+  if (tracks.length === 0) return "";
+  const brand = String(programme?.parent?.programme?.title || "").trim();
+  const episodeTitle = String(programme?.title || pid).trim();
+  const lines = [`# ${brand ? `${brand} \u2014 ${episodeTitle}` : episodeTitle}`, ""];
+  const facts = [];
+  const date = String(programme?.first_broadcast_date || "").slice(0, 10);
+  if (date) facts.push(`**Broadcast** ${date}`);
+  const station = programme?.ownership?.service?.title;
+  if (station) facts.push(`**Station** ${tracklistCell(station)}`);
+  if (facts.length > 0) lines.push(facts.join(" \u00b7 "), "");
+  lines.push(
+    `[Programme page](https://www.bbc.co.uk/programmes/${pid}) \u00b7 [BBC Sounds](https://www.bbc.co.uk/sounds/play/${pid})`,
+    "",
+    `## Tracklist (${tracks.length})`,
+    "",
+    "| # | Time | Artist | Track | Release | Label |",
+    "|---:|---|---|---|---|---|",
+  );
+  tracks.forEach((event, index) => {
+    const seg = event.segment || {};
+    lines.push(
+      `| ${event.position ?? index + 1} | ${tracklistTimestamp(event.version_offset)} | ${tracklistCell(seg.artist)} | ${tracklistCell(seg.track_title)} | ${tracklistCell(seg.release_title)} | ${tracklistCell(seg.record_label)} |`,
+    );
+  });
+  lines.push("", "---", "", `Tracklist data from BBC programme \`${pid}\`.`, "");
+  return lines.join("\n");
+}
+
+// BBC publishes the music played during a programme as structured data. Write it
+// beside the audio: a recording without its tracklist loses the one thing a
+// listener most often wants to look up afterwards.
+async function writeBbcTracklists(urls, destinationPath) {
+  const written = [];
+  const pids = [];
+  for (const url of urls) {
+    if (!isBbcProgrammesUrl(url)) continue;
+    const pid = bbcPidFromUrl(url);
+    if (pid && !pids.includes(pid)) pids.push(pid);
+  }
+  for (const pid of pids) {
+    const [meta, segments] = await Promise.all([
+      fetchBbcJson(`https://www.bbc.co.uk/programmes/${pid}.json`),
+      fetchBbcJson(`https://www.bbc.co.uk/programmes/${pid}/segments.json`),
+    ]);
+    const programme = meta?.programme;
+    if (!programme) continue;
+    const events = Array.isArray(segments?.segment_events)
+      ? segments.segment_events
+      : [];
+    const markdown = buildBbcTracklistMarkdown(programme, events, pid);
+    const base = bbcTracklistBasename(programme);
+    if (!markdown || !base) continue;
+    const target = path.join(destinationPath, `${base}.md`);
+    try {
+      await fsp.writeFile(target, markdown, "utf8");
+      written.push(target);
+    } catch {
+      /* a tracklist is a bonus; never fail the download over one */
+    }
+  }
+  return written;
 }
 
 // ---------- capabilities ----------
@@ -3581,7 +3741,18 @@ module.exports = {
               "vorbis",
               "wav",
             ],
-            description: "Audio extension when mode=audio (default best)",
+            description:
+              "Audio extension when mode=audio. Do NOT set this unless the user named a format themselves. Leaving it unset copies the source audio with no re-encode, which is what almost every request wants; mp3, opus and vorbis re-encode already-lossy audio a second time and permanently degrade it. Any value other than best is refused unless confirmAudioConversion is also true.",
+          },
+          confirmAudioConversion: {
+            type: "boolean",
+            description:
+              "Set true ONLY after the user has explicitly asked for the non-default audioFormat, having been told it re-encodes. Never set this on your own initiative.",
+          },
+          tracklist: {
+            type: "boolean",
+            description:
+              "Write a Markdown tracklist beside each downloaded BBC programme that publishes one. Defaults to true; set false only if the user asks for no tracklist.",
           },
           videoContainer: {
             type: "string",
@@ -3918,6 +4089,10 @@ module.exports = {
     isLikelyPlaylistUrl,
     isBbcProgrammePermalinkUrl,
     isBbcSoundsCollectionUrl,
+    lossyAudioConversionRefusal,
+    buildBbcTracklistMarkdown,
+    bbcTracklistBasename,
+    tracklistTimestamp,
     bbcSoundsKind,
     bbcPidFromUrl,
     bbcProgrammeUrl,

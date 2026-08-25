@@ -24,7 +24,16 @@ const {
   isResolvedSingleMedia,
   extractBbcBroadcastDate,
   mediaCandidateKey,
+  lossyAudioConversionRefusal,
+  buildBbcTracklistMarkdown,
+  bbcTracklistBasename,
+  tracklistTimestamp,
 } = require(join(here, "..", "index.js")).__test;
+
+const plugin = require(join(here, "..", "index.js"));
+const downloadSkill = plugin.skills.find(
+  (skill) => skill.name === "download_media_with_ytdlp",
+);
 
 const EPISODE = "https://www.bbc.co.uk/programmes/m00302xq";
 const SOUNDS_EPISODE = "https://www.bbc.co.uk/sounds/play/m00302xq";
@@ -207,4 +216,97 @@ test("path words are not mistaken for programme ids", () => {
   // The last segment of an episode index is "player"; the pid sits earlier.
   assert.equal(bbcPidFromUrl(EPISODE_INDEX), "m0008w2m");
   assert.equal(bbcEpisodeIndexUrl(EPISODE_INDEX), EPISODE_INDEX);
+});
+
+// --- audio is never silently re-encoded ------------------------------------
+
+test("a lossy audioFormat is refused rather than run", async () => {
+  const out = await downloadSkill.execute(
+    {
+      urls: ["https://example.test/watch/12345"],
+      mode: "audio",
+      audioFormat: "mp3",
+      // A path that must never be created, proving nothing executed.
+      destinationPath: "/tmp/dive-guard-must-not-run",
+    },
+    { dataDir: "/tmp" },
+  );
+  assert.match(out, /^Refused: audioFormat="mp3" was not run\./);
+  assert.match(out, /re-encodes already-lossy audio/);
+  assert.match(out, /confirmAudioConversion=true/);
+});
+
+test("the refusal distinguishes lossy from lossless targets", () => {
+  assert.match(lossyAudioConversionRefusal("mp3"), /already-lossy audio/);
+  assert.match(lossyAudioConversionRefusal("opus"), /already-lossy audio/);
+  assert.match(lossyAudioConversionRefusal("flac"), /no quality and produces much larger files|gains no quality/);
+  assert.match(lossyAudioConversionRefusal("wav"), /gains no quality/);
+});
+
+test("the download skill still asks Dive to confirm before running", () => {
+  assert.equal(downloadSkill.requiresConfirmation, true);
+});
+
+// --- tracklists -------------------------------------------------------------
+
+const trackProgramme = {
+  title: "Harmonious music for nighttime listening",
+  first_broadcast_date: "2026-08-17T22:00:00+01:00",
+  ownership: { service: { title: "BBC Radio 3" } },
+  parent: { programme: { title: "Night Tracks" } },
+};
+
+const trackEvents = [
+  {
+    position: 1,
+    version_offset: 0,
+    segment: {
+      type: "music",
+      artist: "F.S. Blumm",
+      track_title: "Di Lei",
+      release_title: "Torre",
+      record_label: "Leiter",
+    },
+  },
+  {
+    position: 2,
+    version_offset: 3906,
+    segment: { type: "music", artist: "Ola Gjeilo", track_title: "Northern Lights" },
+  },
+];
+
+test("timestamps roll over into hours correctly", () => {
+  assert.equal(tracklistTimestamp(0), "0:00");
+  assert.equal(tracklistTimestamp(306), "5:06");
+  assert.equal(tracklistTimestamp(3906), "1:05:06");
+  assert.equal(tracklistTimestamp(-1), "");
+  assert.equal(tracklistTimestamp("nope"), "");
+});
+
+test("the tracklist filename matches the audio filename", () => {
+  assert.equal(
+    bbcTracklistBasename(trackProgramme),
+    "2026.08.17 \u2014 Night Tracks, Harmonious music for nighttime listening",
+  );
+  assert.equal(bbcTracklistBasename({ title: "" }), "");
+  assert.match(bbcTracklistBasename({ title: "No date" }), /^UnknownDate/);
+  // Path separators must not survive into a filename.
+  assert.doesNotMatch(bbcTracklistBasename({ title: "a/b:c" }), /[/:]/);
+});
+
+test("the tracklist renders every music track and nothing else", () => {
+  const md = buildBbcTracklistMarkdown(trackProgramme, trackEvents, "m00302xq");
+  assert.match(md, /^# Night Tracks \u2014 Harmonious music for nighttime listening$/m);
+  assert.match(md, /\*\*Broadcast\*\* 2026-08-17/);
+  assert.match(md, /## Tracklist \(2\)/);
+  assert.match(md, /\| 1 \| 0:00 \| F\.S\. Blumm \| Di Lei \| Torre \| Leiter \|/);
+  assert.match(md, /\| 2 \| 1:05:06 \| Ola Gjeilo \| Northern Lights \|/);
+});
+
+test("a programme with no music produces no file at all", () => {
+  assert.equal(
+    buildBbcTracklistMarkdown(trackProgramme, [{ segment: { type: "speech" } }], "x"),
+    "",
+  );
+  assert.equal(buildBbcTracklistMarkdown(trackProgramme, [], "x"), "");
 });
