@@ -119,6 +119,9 @@ function isLikelyPlaylistUrl(rawUrl) {
 
 function isGenericMediaCollectionUrl(rawUrl) {
   try {
+    // "programmes" is a collection marker below, which would otherwise make
+    // every single-episode permalink look like a list and open the picker.
+    if (isBbcProgrammePermalinkUrl(rawUrl)) return false;
     const parsed = new URL(rawUrl);
     const pathname = parsed.pathname.toLowerCase();
     const segments = pathname.split("/").filter(Boolean);
@@ -159,6 +162,75 @@ function isGenericMediaCollectionUrl(rawUrl) {
   } catch {
     return false;
   }
+}
+
+const BBC_PID_PATTERN = /^[bmpw][0-9a-z]{7,}$/i;
+const BBC_SOUNDS_EPISODE_PATHS = new Set(["play"]);
+const BBC_SOUNDS_COLLECTION_PATHS = new Set(["brand", "series"]);
+
+// /sounds/<kind>/<pid>: "play" addresses one episode, brand/series a collection.
+function bbcSoundsKind(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!parsed.hostname.toLowerCase().endsWith("bbc.co.uk")) return "";
+    const segments = parsed.pathname.toLowerCase().split("/").filter(Boolean);
+    if (segments.length !== 3 || segments[0] !== "sounds") return "";
+    if (!BBC_PID_PATTERN.test(segments[2])) return "";
+    if (BBC_SOUNDS_EPISODE_PATHS.has(segments[1])) return "episode";
+    if (BBC_SOUNDS_COLLECTION_PATHS.has(segments[1])) return "collection";
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+function isBbcSoundsCollectionUrl(rawUrl) {
+  return bbcSoundsKind(rawUrl) === "collection";
+}
+
+// A bare /programmes/<pid> or /sounds/play/<pid>. Usually one episode, but a
+// brand page is spelled identically, so callers needing certainty must ask
+// BBC's descriptor through resolveBbcProgrammeUrls.
+function isBbcProgrammePermalinkUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!parsed.hostname.toLowerCase().endsWith("bbc.co.uk")) return false;
+    const segments = parsed.pathname.toLowerCase().split("/").filter(Boolean);
+    if (segments.length === 2 && segments[0] === "programmes")
+      return BBC_PID_PATTERN.test(segments[1]);
+    return bbcSoundsKind(rawUrl) === "episode";
+  } catch {
+    return false;
+  }
+}
+
+// Anchored to the pid's position rather than taking the last segment: the pid
+// pattern also matches ordinary path words like "programmes" and "podcasts",
+// and the last segment of an episode index is "player", not a pid.
+function bbcPidFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!parsed.hostname.toLowerCase().endsWith("bbc.co.uk")) return "";
+    const segments = parsed.pathname.toLowerCase().split("/").filter(Boolean);
+    let pid = "";
+    if (segments[0] === "programmes" && segments.length >= 2) pid = segments[1];
+    else if (segments[0] === "sounds" && segments.length >= 3) pid = segments[2];
+    return pid && BBC_PID_PATTERN.test(pid) ? pid : "";
+  } catch {
+    return "";
+  }
+}
+
+// yt-dlp's BBC extractor fails on every /sounds/ form ("Unable to extract
+// playlist data") but resolves the same pid under /programmes/.
+function bbcProgrammeUrl(rawUrl) {
+  const pid = bbcPidFromUrl(rawUrl);
+  return pid ? `https://www.bbc.co.uk/programmes/${pid}` : "";
+}
+
+function bbcEpisodeIndexUrl(rawUrl) {
+  const pid = bbcPidFromUrl(rawUrl);
+  return pid ? `https://www.bbc.co.uk/programmes/${pid}/episodes/player` : "";
 }
 
 function isBbcProgrammesUrl(rawUrl) {
@@ -251,6 +323,7 @@ function isMediaPlaylistUrl(rawUrl) {
     isLikelyPlaylistUrl(rawUrl) ||
     isGenericMediaCollectionUrl(rawUrl) ||
     isBbcEpisodeListUrl(rawUrl) ||
+    isBbcSoundsCollectionUrl(rawUrl) ||
     isRtveSeriesUrl(rawUrl)
   );
 }
@@ -328,6 +401,69 @@ function appendYtDlpCookieArgs(commandArgs, options = {}) {
   }
 }
 
+// True when yt-dlp returned a single playable item rather than a list. Such a
+// result already identifies exactly what to download, so no picker is needed.
+function isResolvedSingleMedia(data) {
+  if (!data || typeof data !== "object") return false;
+  if (data._type === "playlist" || data._type === "multi_video") return false;
+  if (Array.isArray(data.entries)) return false;
+  if (!data.id && !data.title) return false;
+  return (
+    (Array.isArray(data.formats) && data.formats.length > 0) ||
+    typeof data.url === "string" ||
+    Array.isArray(data.requested_downloads)
+  );
+}
+
+// BBC publishes a small descriptor beside every programme page naming its type,
+// which the URL cannot: /programmes/<pid> is equally the shape of one episode
+// and of a whole brand.
+async function fetchBbcProgrammeKind(rawUrl) {
+  const pid = bbcPidFromUrl(rawUrl);
+  if (!pid) return "";
+  try {
+    const result = await exec("curl", [
+      "-sL",
+      "--max-time",
+      "20",
+      "-A",
+      "Mozilla/5.0",
+      `https://www.bbc.co.uk/programmes/${pid}.json`,
+    ]);
+    if (result.code !== 0 || !String(result.stdout || "").trim()) return "";
+    const type = String(
+      JSON.parse(result.stdout)?.programme?.type || "",
+    ).toLowerCase();
+    if (type === "episode" || type === "clip") return "episode";
+    if (type === "brand" || type === "series") return "collection";
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+// Address every BBC link as a programme. Sounds collection links go to the
+// episode index; Sounds episode links to the programme page. A bare
+// /programmes/<pid> is ambiguous, so it is classified first, and anything that
+// will not classify is left untouched rather than rewritten to a URL that may
+// not exist -- Sounds carries podcast-only content with no /programmes/ page.
+async function resolveBbcProgrammeUrls(urls) {
+  if (!urls.some((url) => isBbcProgrammePermalinkUrl(url) || isBbcSoundsCollectionUrl(url)))
+    return urls;
+  const resolved = await Promise.all(
+    urls.map(async (url) => {
+      if (isBbcSoundsCollectionUrl(url)) return bbcEpisodeIndexUrl(url) || url;
+      if (!isBbcProgrammePermalinkUrl(url)) return url;
+      const kind = await fetchBbcProgrammeKind(url);
+      if (!kind) return url;
+      const target =
+        kind === "collection" ? bbcEpisodeIndexUrl(url) : bbcProgrammeUrl(url);
+      return target || url;
+    }),
+  );
+  return dedupeUrls(resolved);
+}
+
 async function runYtDlpJson(
   url,
   options = {},
@@ -342,7 +478,8 @@ async function runYtDlpJson(
   if (playlist) {
     commandArgs.push("--flat-playlist");
     if (Number.isInteger(maxEntries) && maxEntries > 0) {
-      commandArgs.push("--playlist-end", String(maxEntries));
+      // -I supersedes --playlist-end, now an undocumented legacy alias.
+      commandArgs.push("-I", `:${maxEntries}`);
     }
   } else {
     commandArgs.push("--no-playlist");
@@ -807,6 +944,14 @@ function isMediaFileUrl(url) {
   return GENERIC_MEDIA_FILE_RE.test(String(url || ""));
 }
 
+// Site chrome the keyword test below would otherwise wave through.
+const NAV_ONLY_PATH_SEGMENTS = new Set([
+  "about", "accessibility", "audios", "categories", "contact", "contacts",
+  "episodes", "help", "podcasts", "privacy", "programmes", "register",
+  "schedules", "search", "series", "shows", "sign-in", "signin", "terms",
+  "videos",
+]);
+
 function isPlausibleMediaEntryUrl(url, sourceUrl) {
   try {
     const candidate = new URL(url);
@@ -815,7 +960,17 @@ function isPlausibleMediaEntryUrl(url, sourceUrl) {
       return false;
     if (candidate.origin !== source.origin) return false;
     if (candidate.href === source.href) return false;
+    // In-page anchors ("Skip to content") resolve to the source page plus a
+    // fragment, so comparing href alone does not catch them.
+    if (
+      candidate.pathname === source.pathname &&
+      candidate.search === source.search
+    )
+      return false;
     const pathname = candidate.pathname.toLowerCase();
+    const parts = pathname.split("/").filter(Boolean);
+    if (parts.length === 0) return false;
+    if (NAV_ONLY_PATH_SEGMENTS.has(parts[parts.length - 1])) return false;
     return (
       /(?:episode|podcast|audio|video|programme|program|listen|watch|media|track|item|story|show|series)/.test(
         pathname,
@@ -1134,6 +1289,19 @@ async function hasMatchingMediaDiscoveryRule(urls) {
   );
 }
 
+// Compare on host + path so http/https and trailing-slash variants collapse.
+function mediaCandidateKey(value) {
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    return `${parsed.hostname.toLowerCase().replace(/^www\./, "")}${parsed.pathname
+      .replace(/\/+$/, "")
+      .toLowerCase()}${parsed.search}`;
+  } catch {
+    return String(value).trim().toLowerCase();
+  }
+}
+
 function normalizeMediaCandidate(entry, sourceUrl, index) {
   const item = entry && typeof entry === "object" ? entry : {};
   const downloadUrl = firstHttpUrl(
@@ -1332,7 +1500,7 @@ function buildMediaPreviewUiResult(state) {
 }
 
 async function prepareMediaPreviewRequest(args = {}) {
-  const urls = dedupeUrls(args.urls);
+  const urls = await resolveBbcProgrammeUrls(dedupeUrls(args.urls));
   if (urls.length === 0)
     return { error: "Error: no valid URLs were provided." };
   const destinationSelection = selectDestinationPath(args.destinationPath);
@@ -1406,7 +1574,12 @@ async function createMediaPreview(args = {}, context = {}) {
     const hasConfiguredRule = discoveryRules.rules.some((rule) =>
       discoveryRuleMatchesUrl(sourceUrl, rule),
     );
-    if (entries.length === 0 && isRtveSeriesUrl(sourceUrl)) {
+    if (entries.length === 0 && isResolvedSingleMedia(data)) {
+      // yt-dlp resolved this URL to one concrete item. That answer is
+      // authoritative: scraping the page here is what listed page navigation
+      // ("Skip to content", "More menu") as selectable entries.
+      entries = [data];
+    } else if (entries.length === 0 && isRtveSeriesUrl(sourceUrl)) {
       const rtveFallback = await discoverRtveSeriesEntries(sourceUrl);
       entries = rtveFallback.entries;
       fallbackDetail = rtveFallback.detail;
@@ -1506,9 +1679,23 @@ async function createMediaPreview(args = {}, context = {}) {
     return `Error: yt-dlp found no selectable media entries. No download was started.${warnings.length ? `\n${warnings.map((warning) => `${warning.url}: ${warning.detail}`).join("\n")}` : ""}`;
   }
 
-  const candidates = rawCandidates.map(({ entry, sourceUrl }, index) =>
-    normalizeMediaCandidate(entry, sourceUrl, index + 1),
-  );
+  // Index pages hand out http:// links while a direct resolution reports
+  // https://, so the same episode can arrive twice from different sources.
+  const seenCandidateKeys = new Set();
+  const candidates = [];
+  for (const { entry, sourceUrl } of rawCandidates) {
+    const candidate = normalizeMediaCandidate(
+      entry,
+      sourceUrl,
+      candidates.length + 1,
+    );
+    const key = mediaCandidateKey(candidate.downloadUrl);
+    if (key) {
+      if (seenCandidateKeys.has(key)) continue;
+      seenCandidateKeys.add(key);
+    }
+    candidates.push(candidate);
+  }
   const missingUrls = candidates.filter(
     (candidate) => !candidate.downloadUrl,
   ).length;
@@ -1898,6 +2085,11 @@ function extractDateFromSegment(segment) {
 }
 
 function extractBbcBroadcastDate(html) {
+  // JSON-LD datePublished is the original broadcast date and agrees with BBC's
+  // first_broadcast_date. Prefer it: the "Last on" block reports the most recent
+  // repeat, and the bare scan after it can land on an availability expiry.
+  const published = /"datePublished"\s*:\s*"(\d{4})-(\d{2})-(\d{2})/.exec(html);
+  if (published) return `${published[1]}.${published[2]}.${published[3]}`;
   const lastOnBlockMatch = html.match(
     /<h2>\s*Last on\s*<\/h2>[\s\S]{0,12000}/i,
   );
@@ -2197,7 +2389,7 @@ function summarizeDownloadResults(results, destinationPath) {
 }
 
 async function downloadMedia(args) {
-  const urls = dedupeUrls(args.urls);
+  const urls = await resolveBbcProgrammeUrls(dedupeUrls(args.urls));
   if (urls.length === 0) return "Error: no valid URLs were provided.";
 
   const mode = resolveMediaMode(args);
@@ -3724,6 +3916,16 @@ module.exports = {
   },
   __test: {
     isLikelyPlaylistUrl,
+    isBbcProgrammePermalinkUrl,
+    isBbcSoundsCollectionUrl,
+    bbcSoundsKind,
+    bbcPidFromUrl,
+    bbcProgrammeUrl,
+    bbcEpisodeIndexUrl,
+    isPlausibleMediaEntryUrl,
+    isResolvedSingleMedia,
+    extractBbcBroadcastDate,
+    mediaCandidateKey,
     isBbcEpisodeListUrl,
     isRtveSeriesUrl,
     isGenericMediaCollectionUrl,
