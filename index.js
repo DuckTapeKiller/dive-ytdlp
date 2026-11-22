@@ -2388,13 +2388,34 @@ function summarizeDownloadResults(results, destinationPath) {
   return lines.join("\n");
 }
 
+// Whether every address is sound only: yt-dlp lists formats and not one has a
+// picture. Unknown (no answer, no formats, a codec not stated) is not.
+async function soundOnly(urls) {
+  if (!urls.length || urls.length > 5) return false;
+  for (const url of urls) {
+    const probe = await runYtDlpJson(url).catch(() => null);
+    const formats = Array.isArray(probe?.data?.formats) ? probe.data.formats : [];
+    if (!formats.length) return false;
+    if (formats.some((format) => !format || typeof format.vcodec !== "string" || format.vcodec !== "none")) return false;
+  }
+  return true;
+}
+
 async function downloadMedia(args) {
   const urls = await resolveBbcProgrammeUrls(dedupeUrls(args.urls));
   if (urls.length === 0) return "Error: no valid URLs were provided.";
 
-  const mode = resolveMediaMode(args);
+  let mode = resolveMediaMode(args);
   if (!mode) {
     return ambiguousMediaModeMessage(dedupeUrls(args.urls));
+  }
+  // A radio programme asked for as video ("descarga este programa" read as
+  // video) came out as an .mp4 holding sound alone. A source with no picture
+  // is saved as audio, and the summary says why.
+  let modeNote = "";
+  if (mode === "video" && (await soundOnly(urls))) {
+    mode = "audio";
+    modeNote = "Video was asked for, but the source has sound only, so it was saved as audio.";
   }
   const compatibilityProfile =
     args.compatibilityProfile === "source" ||
@@ -2584,6 +2605,7 @@ async function downloadMedia(args) {
         .join("\n")}`;
     }
   }
+  if (modeNote) summary += `\n\n${modeNote}`;
   return summary;
 }
 
@@ -3708,6 +3730,8 @@ module.exports = {
   skills: [
     {
       name: "download_media_with_ytdlp",
+      // Dive puts this among its mandatory tool instructions (plugins.js).
+      rule: "VIDEO AND AUDIO: When the user asks to download, save or get a video, a film, a song, a podcast, a radio or TV programme or other audio and gives a web address (\"descarga este vídeo https://…\", \"download this podcast https://…\"), you MUST call download_media_with_ytdlp with urls set to that address. That call IS the download. Never answer with links, never say you cannot download files, never read the page with web_scraper or http_request instead, and never tell the user to download it themselves. The one question you may ask first is audio or video, when the user has not said and the address could hold either.",
       description:
         "Downloads audio or video from URLs (YouTube, podcasts, BBC, RTVE, and hundreds of other sites) using yt-dlp + ffmpeg. Use for media download requests instead of shell commands. Pass all user URLs in one call. Mode is optional: use audio for podcasts, radio, BBC Sounds, BBC radio programmes, and RTVE /play/audios URLs; use video only when the user explicitly requests video or TV content. If a URL could contain either audio or video and the user has not specified which, ask the user before calling this tool; never guess. When a URL is a playlist, series, collection, podcast feed, or list-like page, the tool first shows a structured selectable preview and downloads only entries explicitly selected in Dive; discovery never downloads media. It tries yt-dlp first, then safe generic HTML/JSON-LD/RSS extraction, then any matching local discovery rule. Set preview=true to force a preview for a list URL whose shape is not recognized automatically. playlistMode retains its ordinary yt-dlp meaning for direct calls. Filenames are automatically prefixed with the release date. destinationPath accepts ~/ paths; defaults to ~/Downloads. Video defaults to the mac-lg-tv profile (MP4/H.264/AAC); use compatibilityProfile='source' only when the user wants best source quality over compatibility. Never pre-create the destination folder; the tool does it. Use manage_media_discovery_rules (or /mediarules) to add a declarative site rule when generic extraction needs help.",
       parameters: {
