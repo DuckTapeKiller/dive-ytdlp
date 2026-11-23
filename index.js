@@ -3726,7 +3726,7 @@ module.exports = {
   name: "media-tools",
   description:
     "yt-dlp downloads, selectable playlist previews, generic and configurable media discovery, FFmpeg/HandBrake transcodes, lossless edits, date rules.",
-  version: "1.3.1",
+  version: "1.4.0",
   skills: [
     {
       name: "download_media_with_ytdlp",
